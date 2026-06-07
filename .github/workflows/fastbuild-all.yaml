@@ -1,211 +1,277 @@
 name: fastbuild ubi2-oc, ubi2, snapshot
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  packages: write
-
+on: workflow_dispatch
+permissions: {contents: write, packages: write}
 env:
-  GH_TOKEN: ${{secrets.GITHUB_TOKEN}}
-  GITHUB_ACTOR: ${{github.actor}}
-  CCACHE_DIR: ${{github.workspace}}/ghcache
+  GH_TOKEN: ${{ github.token }}
+  CONTAINER_ID: ${{ github.event.repository.name }}
+  GH_PAGES: https://w1700k.github.io/${{ github.event.repository.name }}/
+  OPENWRT_DIR: /home/builder/openwrt
+  BUILDER_BIN_DIR: /home/builder/openwrt_bin
+  BUILDER_PROFILE_DIR: /home/builder/user/current
+  BUILDER_TMP_DIR: /tmp/builder
+  OPENWRT_SOURCE_DIR: /tmp/builder/openwrt
+  CCACHE_DIR: ${{ github.workspace }}/ghcache
   CCACHE_MAXSIZE: 2G
-
 jobs:
   build:
-    name: ${{matrix.title}} ${{matrix.target}}
+    name: Build ${{ matrix.target }}
     runs-on: ubuntu-24.04-arm
-    if: |
-      github.event_name == 'push'
-      || github.event_name == 'repository_dispatch'
-      || github.event_name == 'workflow_dispatch'
-      || github.event_name == 'deployment'
-      || (github.event_name == 'watch' && github.event.action == 'started' && github.event.repository.owner.id == github.event.sender.id)
-      || github.event_name == 'schedule'
     strategy:
       fail-fast: false
-      matrix:
-        mode:
-          - normal
-        target: [ubi2-oc, ubi2, SNAPSHOT]
-        include:
-        - mode: normal
-          title: Build
+      matrix: {target: [ubi2-oc, ubi2, SNAPSHOT]}
     env:
-      HOST_WORK_DIR: ${{github.workspace}}
-      BUILD_TARGET: ${{matrix.target}}
-
+      BUILD_TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
     steps:
-    - name: Checkout
+    - name: Checkout repository
       uses: actions/checkout@v6
-      with:
-        fetch-depth: 0
+      with: {fetch-depth: 0}
 
-    - name: Restore ccache from cache
-      uses: actions/cache@v5
+    - name: Restore ccache
+      uses: actions/cache@v5.0.5
       with:
-        path: ${{github.workspace}}/ghcache
-        key: ccache-${{matrix.target}}.${{github.run_id}}
-        restore-keys: |
-          ccache-${{matrix.target}}.
-          ccache-
+        path: ${{ github.workspace }}/ghcache
+        key: ccache-${{ matrix.target }}.${{ github.run_id }}
+        restore-keys: ccache-${{ matrix.target }}.
 
-    - name: Download artifact
-      uses: dawidd6/action-download-artifact@v21
+    - name: Restore downloads cache
+      uses: actions/cache@v5.0.5
       with:
-        workflow: extract-distfeeds.yaml
-        skip_unpack: true
-
-    - name: Prepare artifact
-      run: |
-        install -D distfeeds.list.zip ./user/default/files/etc/apk/repositories.d/distfeeds.list
-        sed -n 's/.*6.18.*-*-\([^/]*\).*/\1/p' distfeeds.list.zip > ./user/default/files/etc/vermagic.txt
+        path: ${{ github.workspace }}/dlcache
+        key: dlcache
 
     - name: Initialize build environment
       run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
-        source scripts/lib/gaction.sh
+        mkdir -p ./user/default/files/etc/apk/repositories.d ./user/default/files/etc
+        curl -Lo ./user/default/files/etc/apk/repositories.d/distfeeds.list ${GH_PAGES}distfeeds.list
+        curl -Lo ./user/default/files/etc/vermagic.txt ${GH_PAGES}vermagic.txt
+        sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+        {"max-concurrent-downloads": 50, "max-concurrent-uploads": 50, "experimental": true}
+        EOF
+        sudo systemctl restart docker
+        echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        TARGET_DIR="${GITHUB_WORKSPACE}/user/${BUILD_TARGET}"
+        [ -d "${TARGET_DIR}" ] || { echo "::error::Target ${BUILD_TARGET} not found"; exit 1; }
+        if [ -d "${GITHUB_WORKSPACE}/user/default" ]; then
+          cp -r "${GITHUB_WORKSPACE}/user/default" "${GITHUB_WORKSPACE}/user/current"
+        else
+          mkdir -p "${GITHUB_WORKSPACE}/user/current"
+        fi
+        rsync -aI "${TARGET_DIR}/" "${GITHUB_WORKSPACE}/user/current/"
+        echo "CONFIG_VERSION_NUMBER=${BUILD_TARGET}" > "${GITHUB_WORKSPACE}/user/current/cvn.config"
+        [ -f "${GITHUB_WORKSPACE}/user/current/config.diff" ] || { echo "::error::config.diff not found"; exit 1; }
+        [ ! -f "${GITHUB_WORKSPACE}/user/default/settings.ini" ] || source "${GITHUB_WORKSPACE}/user/default/settings.ini"
+        source "${GITHUB_WORKSPACE}/user/current/settings.ini"
+        [ -n "$BUILDER_TAG" ] && [ -n "$REPO_URL" ] && [ -n "$REPO_BRANCH" ] || { echo "::error::Missing required settings"; exit 1; }
+        cat >> "$GITHUB_ENV" <<EOF
+        BUILDER_TAG=${BUILDER_TAG}
+        REPO_URL=${REPO_URL}
+        REPO_BRANCH=${REPO_BRANCH}
+        EOF
+        mkdir -p "${GITHUB_WORKSPACE}/openwrt_bin" "${BUILDER_TMP_DIR}" "${CCACHE_DIR}" "${GITHUB_WORKSPACE}/dlcache"
+        chmod 777 "${GITHUB_WORKSPACE}/openwrt_bin" "${BUILDER_TMP_DIR}"
+        sudo tee /usr/local/bin/docker_exec > /dev/null <<'DKR'
+        #!/bin/bash
+        set -e
+        exec_envs=()
+        IFS=$' '
+        for env_name in BUILDER_TMP_DIR BUILDER_BIN_DIR BUILDER_PROFILE_DIR OPENWRT_DIR OPENWRT_SOURCE_DIR REPO_URL REPO_BRANCH; do
+          exec_envs+=( -e "${env_name}=${!env_name}" )
+        done
+        exec docker exec -u 0 -i "${exec_envs[@]}" "$@"
+        DKR
+        sudo chmod +x /usr/local/bin/docker_exec
 
-        "${HOST_WORK_DIR}/scripts/host/init_runner.sh" main build
-        configure_docker
-        login_to_registry
-
-    - name: Set up Docker Buildx
+    - name: Setup Docker Buildx
       uses: docker/setup-buildx-action@v4
 
-    - name: Check and prepare builders
+    - name: Prepare builder container
       run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
-        source scripts/lib/gaction.sh
-
-        if [ "x${OPT_REBUILD}" != "x1" ]; then
-          set +eo pipefail
-          docker buildx imagetools inspect "${BUILDER_IMAGE_ID_INC}" > /dev/null 2>&1
-          builder_inc_ret_val=$?
-          set -eo pipefail
-
-          if [ "x${OPT_REBASE}" = "x1" ] || [ "x${builder_inc_ret_val}" != "x0" ]; then
-            set +eo pipefail
-            docker buildx imagetools inspect "${BUILDER_IMAGE_ID_BASE}" >/dev/null 2>&1
-            builder_base_ret_val=$?
-            set -eo pipefail
-            if [ "x${builder_base_ret_val}" != "x0" ]; then
-              echo "Base builder '${BUILDER_IMAGE_ID_BASE}' does not exist, creating one"
-              OPT_REBUILD=1
-            else
-              echo "Creating incremental builder '${BUILDER_IMAGE_ID_INC}' from base builder '${BUILDER_IMAGE_ID_BASE}'"
-              create_remote_tag_alias "${BUILDER_IMAGE_ID_BASE}" "${BUILDER_IMAGE_ID_INC}"
-            fi
+        OPT_REBUILD=${OPT_REBUILD:-0}
+        BUILDER_TAG_INC="${BUILDER_TAG}-inc"
+        BUILDER_IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${CONTAINER_ID}:${BUILDER_TAG}"
+        BUILDER_IMAGE_INC="ghcr.io/${{ github.repository_owner }}/${CONTAINER_ID}:${BUILDER_TAG_INC}"
+        if [ "${OPT_REBUILD}" != "1" ] && ! docker buildx imagetools inspect "${BUILDER_IMAGE_INC}" &>/dev/null; then
+          if ! docker buildx imagetools inspect "${BUILDER_IMAGE_BASE}" &>/dev/null; then
+            OPT_REBUILD=1; echo "Will rebuild base builder"
+          else
+            docker buildx imagetools create -t "${BUILDER_IMAGE_INC}" "${BUILDER_IMAGE_BASE}"
+            echo "Created incremental builder from base"
           fi
         fi
-
-        if [ "x${OPT_REBUILD}" = "x1" ]; then
-          echo "Re-creating base builder '${BUILDER_IMAGE_ID_BASE}'"
-        fi
-        _set_env OPT_REBUILD
-
-    - name: Get or create builder container
-      run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
-
-        # Ensure ccache directory exists
-        mkdir -p "${CCACHE_DIR}"
-
-        eval "declare -a MOUNT_OPTS=( $(printf '%b' "${BUILDER_MOUNT_OPTS//%/\\x}") )"
-        # Add ccache mount to MOUNT_OPTS
-        MOUNT_OPTS+=( "--mount" "type=bind,source=${CCACHE_DIR},target=/ghcache" )
-
-        if [ "x${OPT_REBUILD}" != "x1" ]; then
-          pull_image "${BUILDER_IMAGE_ID_INC}"
-          docker run -d -t --name "${BUILDER_CONTAINER_ID}" "${MOUNT_OPTS[@]}" --env GITHUB_ENV=${GITHUB_ENV} "${BUILDER_IMAGE_ID_INC}"
+        [ "${OPT_REBUILD}" = "1" ] && echo "Re-creating base builder '${BUILDER_IMAGE_BASE}'"
+        { echo "OPT_REBUILD=${OPT_REBUILD}"; echo "BUILDER_TAG_INC=${BUILDER_TAG_INC}"; echo "BUILDER_IMAGE_BASE=${BUILDER_IMAGE_BASE}"; echo "BUILDER_IMAGE_INC=${BUILDER_IMAGE_INC}"; } >> "$GITHUB_ENV"
+        pull_image() {
+          local img="${1}"
+          [ -n "${img}" ] || { echo "No argument for pulling" >&2; exit 1; }
+          (set +eo pipefail; docker pull "${img}" 2> >(tee /tmp/dockerpull_stderr.log >&2); local rc=$?)
+          if [ ${rc} -ne 0 ] && grep -q "max depth exceeded" /tmp/dockerpull_stderr.log; then
+            echo "::error::Your image has exceeded maximum layer limit. You need to manually rebase or rebuild this image."; exit 1
+          fi
+          return ${rc}
+        }
+        run_container() {
+          docker run -d -t --name "${CONTAINER_ID}" \
+            -v "${GITHUB_WORKSPACE}/user:/home/builder/user" \
+            -v "${GITHUB_WORKSPACE}/openwrt_bin:${BUILDER_BIN_DIR}" \
+            -v "${GITHUB_ENV}:${GITHUB_ENV}" \
+            -v "${GITHUB_WORKSPACE}/dlcache:/dlcache" \
+            -v "${CCACHE_DIR}:/ghcache" \
+            --env "GITHUB_ENV=${GITHUB_ENV}" "$@"
+        }
+        if [ "${OPT_REBUILD}" = "1" ]; then
+          run_container ghcr.io/w1700k/fastbuild_base:debian-arm
         else
-          docker run -d -t --name "${BUILDER_CONTAINER_ID}" "${MOUNT_OPTS[@]}" --env GITHUB_ENV=${GITHUB_ENV} "${BUILDER_IMAGE_ID_BUILDENV}"
+          pull_image "${BUILDER_IMAGE_INC}" || pull_image "${BUILDER_IMAGE_BASE}" || true
+          run_container "${BUILDER_IMAGE_INC}" 2>/dev/null || run_container "${BUILDER_IMAGE_BASE}"
         fi
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/init_env.sh"
+        docker_exec "${CONTAINER_ID}" bash <<'DKSETUP'
+        set -e
+        OPENWRT_DIR="/home/builder/openwrt"
+        [ -d "${OPENWRT_DIR}" ] && OPENWRT_DIR="${OPENWRT_SOURCE_DIR}"
+        [ ! -d "${OPENWRT_DIR}" ] || rm -rf "${OPENWRT_DIR}"
+        sudo -E apt-get -qq update
+        pkgs=(build-essential clang curl flex bison g++ gawk gcc gettext git libncurses5-dev libssl-dev python3-distutils-extra rsync swig unzip zlib1g-dev file wget ccache golang)
+        if ! dpkg -s "${pkgs[@]}" &>/dev/null; then
+          sudo -E apt-get -qq install -y --no-upgrade "${pkgs[@]}"
+        fi
+        DKSETUP
 
-    - name: Prepare OpenWrt source (clone, configure, download)
+    - name: Prepare OpenWrt source
       run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
+        docker_exec "${CONTAINER_ID}" bash <<'PSOURCE'
+        set -e
+        link_bin() {
+          local BIN_DIR="/home/builder/openwrt/bin"
+          local BIN_MOUNT_POINT="${BUILDER_BIN_DIR}"
+          if mountpoint "${BIN_MOUNT_POINT}"; then
+            if [[ ! -L "${BIN_DIR}" || ! -d "${BIN_DIR}" || "$(readlink "${BIN_DIR}")" != "${BIN_MOUNT_POINT}" ]]; then
+              echo "'bin' link does not exist, creating"
+              rm -rf "${BIN_DIR}" || true
+              ln -sf "${BIN_MOUNT_POINT}" "${BIN_DIR}"
+            fi
+          else
+            echo "::error::'${BIN_MOUNT_POINT}' not mounted!" >&2; exit 1
+          fi
+        }
+        [ -n "${OPENWRT_DIR}" ] && [ -n "${OPENWRT_SOURCE_DIR}" ] || { echo "::error::Missing OPENWRT_* dir vars" >&2; exit 1; }
+        [ -n "${REPO_URL}" ] && [ -n "${REPO_BRANCH}" ] || { echo "::error::'REPO_URL' or 'REPO_BRANCH' is empty" >&2; exit 1; }
+        if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ] && [ -d "/home/builder/openwrt/.git" ]; then
+          git clone "/home/builder/openwrt" "${OPENWRT_DIR}"
+          git -C "${OPENWRT_DIR}" remote set-url origin "${REPO_URL}"
+          git -C "${OPENWRT_DIR}" fetch
+          git -C "${OPENWRT_DIR}" checkout "${REPO_BRANCH}"
+          git -C "${OPENWRT_DIR}" pull --rebase
+        else
+          mkdir -p "${OPENWRT_DIR}"; cd "${OPENWRT_DIR}"
+          git init
+          git remote add origin "${REPO_URL}" 2>/dev/null || git remote set-url origin "${REPO_URL}"
+          git fetch
+          git checkout "${REPO_BRANCH}"
+          git pull --rebase
+          mkdir -p files
+          git log origin/main.."${REPO_BRANCH}" --oneline > files/build_info 2>/dev/null || echo "(no commits ahead of main)" > files/build_info
+          cp files/build_info "${BUILDER_BIN_DIR}" 2>/dev/null || true
+        fi
+        link_bin
+        if [ -f "${BUILDER_PROFILE_DIR}/files/feeds.conf" ]; then
+          cp "${BUILDER_PROFILE_DIR}/files/feeds.conf" "${OPENWRT_DIR}/feeds.conf"
+        fi
+        if [ -f "${OPENWRT_DIR}/feeds.conf" ]; then
+          cp "${OPENWRT_DIR}/feeds.conf" "${BUILDER_TMP_DIR}/feeds.conf.bak"
+        fi
+        if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ]; then
+          if (set +e; cd "/home/builder/openwrt" && ./scripts/feeds list -fs > "${BUILDER_TMP_DIR}/feeds.conf.prev"); then
+            mv "${BUILDER_TMP_DIR}/feeds.conf.prev" "${OPENWRT_DIR}/feeds.conf"
+          else
+            echo "::warning::Could not read previous feeds list"
+            rm -f "${BUILDER_TMP_DIR}/feeds.conf.prev"
+          fi
+        fi
+        (cd "${OPENWRT_DIR}"; rm -rf feeds/* 2>/dev/null; ./scripts/feeds update -a; ./scripts/feeds install -a)
+        if [ -f "${BUILDER_TMP_DIR}/feeds.conf.bak" ]; then
+          mv "${BUILDER_TMP_DIR}/feeds.conf.bak" "${OPENWRT_DIR}/feeds.conf"
+        fi
+        cp "${BUILDER_PROFILE_DIR}/config.diff" "${OPENWRT_DIR}/.config"
+        echo 'CONFIG_CCACHE_DIR="/ghcache"' >> "${OPENWRT_DIR}/.config"
+        cp "${BUILDER_PROFILE_DIR}/cvn.config" "${OPENWRT_DIR}/cvn.config"
+        if [ -n "$(ls -A "${BUILDER_PROFILE_DIR}/patches" 2>/dev/null)" ]; then
+          (find "${BUILDER_PROFILE_DIR}/patches" -type f -name '*.patch' -print0 | sort -z | xargs -I % -t -0 -n 1 sh -c "cat '%'  | patch -d '${OPENWRT_DIR}' -p0 --forward"; true)
+        fi
+        declare -a sync_exclude_opts=()
+        for item in /bin /dl /tmp /build_dir /staging_dir /toolchain /logs *.o key-build*; do sync_exclude_opts+=( "--exclude=${item}" ); done
+        [ ! -e "${BUILDER_PROFILE_DIR}/files" ] || cp -r "${BUILDER_PROFILE_DIR}/files/" "${OPENWRT_DIR}/"
+        [ ! -f "${BUILDER_PROFILE_DIR}/custom.sh" ] || (cd "${OPENWRT_DIR}"; /bin/bash "${BUILDER_PROFILE_DIR}/custom.sh")
+        if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ]; then
+          rsync -camv --no-t --delete "${sync_exclude_opts[@]}" "${OPENWRT_DIR}/" "/home/builder/openwrt/"
+          rm -rf "${OPENWRT_DIR}"
+          echo "OPENWRT_DIR=/home/builder/openwrt" >> $GITHUB_ENV
+        fi
+        cd "${OPENWRT_DIR}"; make defconfig; cat cvn.config >> .config
+        ln -sf /dlcache dl 2>/dev/null || true
+        make download -j8
+        PSOURCE
 
-        # Clone/update OpenWrt
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/update_repo.sh"
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/update_feeds.sh"
-
-        # Apply customizations
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/customize.sh"
-
-        # Prepare config file
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/config.sh"
-
-        # Download packages
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/download.sh"
-
-    - name: Compile OpenWrt with multiple threads
+    - name: Compile OpenWrt
       id: compile
       continue-on-error: true
       run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
+        cat > /tmp/compile_runner.sh << 'CRUN'
+        set -e
+        compile() {
+          cd "${OPENWRT_DIR}"
+          local nthread=$(($(nproc) + 1))
+          export FORCE_UNSAFE_CONFIGURE=1
+          if [ "${MODE}" = "m" ]; then echo "${nthread} thread compile: $*"; make -j${nthread} "$@"
+          elif [ "${MODE}" = "s" ]; then echo "${nthread} thread compile: $*"; make -j${nthread} V=s "$@"
+          else echo "No MODE specified" >&2; exit 1; fi
+        }
+        [ ! -f "${BUILDER_PROFILE_DIR}/pre_compile.sh" ] || /bin/bash "${BUILDER_PROFILE_DIR}/pre_compile.sh"
+        compile
+        CRUN
+        docker cp /tmp/compile_runner.sh "${CONTAINER_ID}:/tmp/compile_runner.sh"
         echo "started=1" >> $GITHUB_OUTPUT
-        docker_exec -e MODE=m "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/compile.sh"
+        docker_exec -e MODE=m "${CONTAINER_ID}" bash /tmp/compile_runner.sh
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Recompile verbosely if failed
+    - name: Retry compile with verbose output
       if: steps.compile.outputs.started == '1' && steps.compile.outputs.status != 'success'
       run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
-        docker_exec -e MODE=s "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/compile.sh"
+        docker_exec -e MODE=s "${CONTAINER_ID}" bash /tmp/compile_runner.sh
 
-    - name: Organize files
+    - name: Organize firmware artifacts
       id: organize
       run: |
-        set -eo pipefail
         shopt -s extglob
-
-        sudo chown -R "$(id -u):$(id -g)" "${HOST_BIN_DIR}"
-        mkdir "${HOST_WORK_DIR}/openwrt_firmware"
-        cd "${HOST_BIN_DIR}/targets/"*/*
+        sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/openwrt_bin"
+        mkdir -p "${GITHUB_WORKSPACE}/openwrt_firmware"
+        cd "${GITHUB_WORKSPACE}/openwrt_bin/targets/"*/*
         all_firmware_files=( !(packages) )
-        [ ${#all_firmware_files[@]} -gt 0 ] && mv "${all_firmware_files[@]}" "${HOST_WORK_DIR}/openwrt_firmware/" || true
+        [ ${#all_firmware_files[@]} -gt 0 ] && mv "${all_firmware_files[@]}" "${GITHUB_WORKSPACE}/openwrt_firmware/" || true
         echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Create Release
+    - name: Create GitHub release
       if: steps.organize.outputs.status == 'success' && !cancelled()
       run: |
         version_code=$(jq -r '.version_code' ./openwrt_firmware/profiles.json)
-        VERSION="${{matrix.target}}-$(date +'%Y.%m.%d')-${version_code}"
-        sed -i "s/^/    /; 1s/^/## $VERSION\n\n/" "${HOST_BIN_DIR}/build_info"
-        if gh release view "$VERSION" &>/dev/null; then
-          gh release delete "$VERSION" --cleanup-tag -y
-        fi
+        VERSION="${{ matrix.target }}_$(date +'%Y.%m.%d')_${version_code}"
+        sed -i "s/^/    /; 1s/^/## $VERSION\n\n/" "${GITHUB_WORKSPACE}/openwrt_bin/build_info"
+        if gh release view "$VERSION" &>/dev/null; then gh release delete "$VERSION" --cleanup-tag -y; fi
         FILES_TO_UPLOAD=$(find ./openwrt_firmware -maxdepth 1 -type f -name "*sysupgrade.itb")
-        gh release create "$VERSION" $FILES_TO_UPLOAD \
-          --title "$VERSION" \
-          --notes-file "${HOST_BIN_DIR}/build_info"
+        gh release create "$VERSION" $FILES_TO_UPLOAD --title "$VERSION" --notes-file "${GITHUB_WORKSPACE}/openwrt_bin/build_info"
 
-    - name: Upload builder and cleanup
-      if: |
-        env.SKIP_TARGET == '0' && !cancelled() && (
-          job.status == 'success'
-          || env.OPT_PUSH_WHEN_FAIL == '1'
-        )
+    - name: Upload builder container
+      if: success()
       run: |
-        set -eo pipefail
-        source scripts/host/ghcr.sh
-
-        docker_exec "${BUILDER_CONTAINER_ID}" "${BUILDER_WORK_DIR}/scripts/pre_commit.sh"
-        docker commit -a "openwrtfanboy/openwrt-fastbuild" -m "Building at $(date)" "${BUILDER_CONTAINER_ID}" "${BUILDER_IMAGE_ID_INC}"
-        docker container rm -fv "${BUILDER_CONTAINER_ID}"
-        docker container prune -f
+        docker_exec "${CONTAINER_ID}" bash <<'PC'
+        set -e
+        if [ -d "${OPENWRT_SOURCE_DIR}" ]; then rm -rf "${OPENWRT_SOURCE_DIR}"; fi
+        cd "${OPENWRT_DIR}"; make clean; rm -rf feeds/* tmp/*; find dl -type f -mtime +30 -delete
+        PC
+        docker commit -a "openwrt-fastbuild" -m "Building at $(date)" "${CONTAINER_ID}" "${BUILDER_IMAGE_INC}"
+        docker container rm -fv "${CONTAINER_ID}"
         docker system prune -f --volumes
-        docker push "${BUILDER_IMAGE_ID_INC}"
-        if [ "x${OPT_REBUILD}" = "x1" ]; then
-          create_remote_tag_alias "${BUILDER_IMAGE_ID_INC}" "${BUILDER_IMAGE_ID_BASE}"
-        fi
+        docker push "${BUILDER_IMAGE_INC}"
+        if [ "${OPT_REBUILD}" = "1" ]; then docker buildx imagetools create -t "${BUILDER_IMAGE_BASE}" "${BUILDER_IMAGE_INC}"; fi
