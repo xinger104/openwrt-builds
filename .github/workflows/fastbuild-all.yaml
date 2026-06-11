@@ -5,6 +5,7 @@ env:
   GH_TOKEN: ${{ github.token }}
   CONTAINER_ID: ${{ github.event.repository.name }}
   GH_PAGES: https://w1700k.github.io/${{ github.event.repository.name }}/
+  BASE_IMAGE: ghcr.io/w1700k/fastbuild_base:debian-arm
   OPENWRT_DIR: /home/builder/openwrt
   BUILDER_BIN_DIR: /home/builder/openwrt_bin
   BUILDER_PROFILE_DIR: /home/builder/user/current
@@ -47,36 +48,27 @@ jobs:
         mkdir -p ./user/default/files/etc/apk/repositories.d ./user/default/files/etc
         curl -Lo ./user/default/files/etc/apk/repositories.d/distfeeds.list ${GH_PAGES}distfeeds.list
         curl -Lo ./user/default/files/etc/vermagic.txt ${GH_PAGES}vermagic.txt
-        sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+        sudo tee /etc/docker/daemon.json > /dev/null <<'EOF'
         {"max-concurrent-downloads": 50, "max-concurrent-uploads": 50, "experimental": true}
         EOF
         sudo systemctl restart docker
         echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
         TARGET_DIR="${GITHUB_WORKSPACE}/user/${BUILD_TARGET}"
         [ -d "${TARGET_DIR}" ] || { echo "::error::Target ${BUILD_TARGET} not found"; exit 1; }
-        if [ -d "${GITHUB_WORKSPACE}/user/default" ]; then
-          cp -r "${GITHUB_WORKSPACE}/user/default" "${GITHUB_WORKSPACE}/user/current"
-        else
-          mkdir -p "${GITHUB_WORKSPACE}/user/current"
-        fi
-        rsync -aI "${TARGET_DIR}/" "${GITHUB_WORKSPACE}/user/current/"
+        [ -d "${GITHUB_WORKSPACE}/user/default" ] && cp -r "${GITHUB_WORKSPACE}/user/default" "${GITHUB_WORKSPACE}/user/current" || mkdir -p "${GITHUB_WORKSPACE}/user/current"
+        rsync -a --delete "${TARGET_DIR}/" "${GITHUB_WORKSPACE}/user/current/"
         echo "CONFIG_VERSION_NUMBER=${BUILD_TARGET}" > "${GITHUB_WORKSPACE}/user/current/cvn.config"
         [ -f "${GITHUB_WORKSPACE}/user/current/config.diff" ] || { echo "::error::config.diff not found"; exit 1; }
         [ ! -f "${GITHUB_WORKSPACE}/user/default/settings.ini" ] || source "${GITHUB_WORKSPACE}/user/default/settings.ini"
         source "${GITHUB_WORKSPACE}/user/current/settings.ini"
         [ -n "$BUILDER_TAG" ] && [ -n "$REPO_URL" ] && [ -n "$REPO_BRANCH" ] || { echo "::error::Missing required settings"; exit 1; }
-        cat >> "$GITHUB_ENV" <<EOF
-        BUILDER_TAG=${BUILDER_TAG}
-        REPO_URL=${REPO_URL}
-        REPO_BRANCH=${REPO_BRANCH}
-        EOF
+        for var in BUILDER_TAG REPO_URL REPO_BRANCH; do echo "${var}=${!var}" >> "$GITHUB_ENV"; done
         mkdir -p "${GITHUB_WORKSPACE}/openwrt_bin" "${BUILDER_TMP_DIR}" "${CCACHE_DIR}" "${GITHUB_WORKSPACE}/dlcache"
         chmod 777 "${GITHUB_WORKSPACE}/openwrt_bin" "${BUILDER_TMP_DIR}"
         sudo tee /usr/local/bin/docker_exec > /dev/null <<'DKR'
         #!/bin/bash
         set -e
         exec_envs=()
-        IFS=$' '
         for env_name in BUILDER_TMP_DIR BUILDER_BIN_DIR BUILDER_PROFILE_DIR OPENWRT_DIR OPENWRT_SOURCE_DIR REPO_URL REPO_BRANCH; do
           exec_envs+=( -e "${env_name}=${!env_name}" )
         done
@@ -102,15 +94,11 @@ jobs:
           fi
         fi
         [ "${OPT_REBUILD}" = "1" ] && echo "Re-creating base builder '${BUILDER_IMAGE_BASE}'"
-        { echo "OPT_REBUILD=${OPT_REBUILD}"; echo "BUILDER_TAG_INC=${BUILDER_TAG_INC}"; echo "BUILDER_IMAGE_BASE=${BUILDER_IMAGE_BASE}"; echo "BUILDER_IMAGE_INC=${BUILDER_IMAGE_INC}"; } >> "$GITHUB_ENV"
+        for var in OPT_REBUILD BUILDER_TAG_INC BUILDER_IMAGE_BASE BUILDER_IMAGE_INC; do echo "${var}=${!var}" >> "$GITHUB_ENV"; done
         pull_image() {
-          local img="${1}"
+          local img="$1"
           [ -n "${img}" ] || { echo "No argument for pulling" >&2; exit 1; }
-          (set +eo pipefail; docker pull "${img}" 2> >(tee /tmp/dockerpull_stderr.log >&2); local rc=$?)
-          if [ ${rc} -ne 0 ] && grep -q "max depth exceeded" /tmp/dockerpull_stderr.log; then
-            echo "::error::Your image has exceeded maximum layer limit. You need to manually rebase or rebuild this image."; exit 1
-          fi
-          return ${rc}
+          docker pull "${img}" 2>/tmp/dockerpull_stderr || { grep -q "max depth exceeded" /tmp/dockerpull_stderr && { echo "::error::Your image has exceeded maximum layer limit. You need to manually rebase or rebuild this image."; exit 1; }; return 1; }
         }
         run_container() {
           docker run -d -t --name "${CONTAINER_ID}" \
@@ -122,7 +110,7 @@ jobs:
             --env "GITHUB_ENV=${GITHUB_ENV}" "$@"
         }
         if [ "${OPT_REBUILD}" = "1" ]; then
-          run_container ghcr.io/w1700k/fastbuild_base:debian-arm
+          run_container "${BASE_IMAGE}"
         else
           pull_image "${BUILDER_IMAGE_INC}" || pull_image "${BUILDER_IMAGE_BASE}" || true
           run_container "${BUILDER_IMAGE_INC}" 2>/dev/null || run_container "${BUILDER_IMAGE_BASE}"
@@ -133,10 +121,7 @@ jobs:
         [ -d "${OPENWRT_DIR}" ] && OPENWRT_DIR="${OPENWRT_SOURCE_DIR}"
         [ ! -d "${OPENWRT_DIR}" ] || rm -rf "${OPENWRT_DIR}"
         sudo -E apt-get -qq update
-        pkgs=(build-essential clang curl flex bison g++ gawk gcc gettext git libncurses5-dev libssl-dev python3-distutils-extra rsync swig unzip zlib1g-dev file wget ccache golang)
-        if ! dpkg -s "${pkgs[@]}" &>/dev/null; then
-          sudo -E apt-get -qq install -y --no-upgrade "${pkgs[@]}"
-        fi
+        sudo -E apt-get -qq install -y --no-upgrade build-essential clang curl flex bison g++ gawk gcc gettext git libncurses5-dev libssl-dev python3-distutils-extra rsync swig unzip zlib1g-dev file wget ccache golang
         DKSETUP
 
     - name: Prepare OpenWrt source
@@ -144,17 +129,9 @@ jobs:
         docker_exec "${CONTAINER_ID}" bash <<'PSOURCE'
         set -e
         link_bin() {
-          local BIN_DIR="/home/builder/openwrt/bin"
-          local BIN_MOUNT_POINT="${BUILDER_BIN_DIR}"
-          if mountpoint "${BIN_MOUNT_POINT}"; then
-            if [[ ! -L "${BIN_DIR}" || ! -d "${BIN_DIR}" || "$(readlink "${BIN_DIR}")" != "${BIN_MOUNT_POINT}" ]]; then
-              echo "'bin' link does not exist, creating"
-              rm -rf "${BIN_DIR}" || true
-              ln -sf "${BIN_MOUNT_POINT}" "${BIN_DIR}"
-            fi
-          else
-            echo "::error::'${BIN_MOUNT_POINT}' not mounted!" >&2; exit 1
-          fi
+          mountpoint -q "${BUILDER_BIN_DIR}" || { echo "::error::not mounted" >&2; exit 1; }
+          [ -L "/home/builder/openwrt/bin" ] && [ "$(readlink "/home/builder/openwrt/bin")" = "${BUILDER_BIN_DIR}" ] && return
+          rm -rf /home/builder/openwrt/bin && ln -sf "${BUILDER_BIN_DIR}" /home/builder/openwrt/bin
         }
         [ -n "${OPENWRT_DIR}" ] && [ -n "${OPENWRT_SOURCE_DIR}" ] || { echo "::error::Missing OPENWRT_* dir vars" >&2; exit 1; }
         [ -n "${REPO_URL}" ] && [ -n "${REPO_BRANCH}" ] || { echo "::error::'REPO_URL' or 'REPO_BRANCH' is empty" >&2; exit 1; }
@@ -198,14 +175,14 @@ jobs:
         echo 'CONFIG_CCACHE_DIR="/ghcache"' >> "${OPENWRT_DIR}/.config"
         cp "${BUILDER_PROFILE_DIR}/cvn.config" "${OPENWRT_DIR}/cvn.config"
         if [ -n "$(ls -A "${BUILDER_PROFILE_DIR}/patches" 2>/dev/null)" ]; then
-          (find "${BUILDER_PROFILE_DIR}/patches" -type f -name '*.patch' -print0 | sort -z | xargs -I % -t -0 -n 1 sh -c "cat '%'  | patch -d '${OPENWRT_DIR}' -p0 --forward"; true)
+          find "${BUILDER_PROFILE_DIR}/patches" -type f -name '*.patch' -print0 | sort -z | xargs -0 -n 1 sh -c "cat '$1' | patch -d '${OPENWRT_DIR}' -p0 --forward" sh
         fi
-        declare -a sync_exclude_opts=()
-        for item in /bin /dl /tmp /build_dir /staging_dir /toolchain /logs *.o key-build*; do sync_exclude_opts+=( "--exclude=${item}" ); done
-        [ ! -e "${BUILDER_PROFILE_DIR}/files" ] || cp -r "${BUILDER_PROFILE_DIR}/files/" "${OPENWRT_DIR}/"
+        [ ! -d "${BUILDER_PROFILE_DIR}/files" ] || cp -r "${BUILDER_PROFILE_DIR}/files/" "${OPENWRT_DIR}/"
         [ ! -f "${BUILDER_PROFILE_DIR}/custom.sh" ] || (cd "${OPENWRT_DIR}"; /bin/bash "${BUILDER_PROFILE_DIR}/custom.sh")
         if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ]; then
-          rsync -camv --no-t --delete "${sync_exclude_opts[@]}" "${OPENWRT_DIR}/" "/home/builder/openwrt/"
+          rsync -am --size-only --no-t --delete \
+            --exclude={/bin,/dl,/tmp,/build_dir,/staging_dir,/toolchain,/logs,'*.o',key-build\*} \
+            "${OPENWRT_DIR}/" "/home/builder/openwrt/"
           rm -rf "${OPENWRT_DIR}"
           echo "OPENWRT_DIR=/home/builder/openwrt" >> $GITHUB_ENV
         fi
@@ -224,16 +201,14 @@ jobs:
           cd "${OPENWRT_DIR}"
           local nthread=$(($(nproc) + 1))
           export FORCE_UNSAFE_CONFIGURE=1
-          if [ "${MODE}" = "m" ]; then echo "${nthread} thread compile: $*"; make -j${nthread} "$@"
-          elif [ "${MODE}" = "s" ]; then echo "${nthread} thread compile: $*"; make -j${nthread} V=s "$@"
-          else echo "No MODE specified" >&2; exit 1; fi
+          echo "${nthread} thread compile: (MODE=${MODE})"; make -j${nthread} V=${MODE}
         }
         [ ! -f "${BUILDER_PROFILE_DIR}/pre_compile.sh" ] || /bin/bash "${BUILDER_PROFILE_DIR}/pre_compile.sh"
         compile
         CRUN
         docker cp /tmp/compile_runner.sh "${CONTAINER_ID}:/tmp/compile_runner.sh"
         echo "started=1" >> $GITHUB_OUTPUT
-        docker_exec -e MODE=m "${CONTAINER_ID}" bash /tmp/compile_runner.sh
+        docker_exec -e MODE=c "${CONTAINER_ID}" bash /tmp/compile_runner.sh
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Retry compile with verbose output
@@ -244,12 +219,12 @@ jobs:
     - name: Organize firmware artifacts
       id: organize
       run: |
-        shopt -s extglob
         sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/openwrt_bin"
         mkdir -p "${GITHUB_WORKSPACE}/openwrt_firmware"
-        cd "${GITHUB_WORKSPACE}/openwrt_bin/targets/"*/*
-        all_firmware_files=( !(packages) )
-        [ ${#all_firmware_files[@]} -gt 0 ] && mv "${all_firmware_files[@]}" "${GITHUB_WORKSPACE}/openwrt_firmware/" || true
+        cd "${GITHUB_WORKSPACE}/openwrt_bin/targets/"*/*/
+        for f in *; do
+          [ "$f" != "packages" ] && [ -f "$f" ] && mv "$f" "${GITHUB_WORKSPACE}/openwrt_firmware/"
+        done
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Create GitHub release
@@ -259,8 +234,7 @@ jobs:
         VERSION="${{ matrix.target }}_$(date +'%Y.%m.%d')_${version_code}"
         sed -i "s/^/    /; 1s/^/## $VERSION\n\n/" "${GITHUB_WORKSPACE}/openwrt_bin/build_info"
         if gh release view "$VERSION" &>/dev/null; then gh release delete "$VERSION" --cleanup-tag -y; fi
-        FILES_TO_UPLOAD=$(find ./openwrt_firmware -maxdepth 1 -type f -name "*sysupgrade.itb")
-        gh release create "$VERSION" $FILES_TO_UPLOAD --title "$VERSION" --notes-file "${GITHUB_WORKSPACE}/openwrt_bin/build_info"
+        gh release create "$VERSION" $(find ./openwrt_firmware -maxdepth 1 -type f -name "*sysupgrade.itb") --title "$VERSION" --notes-file "${GITHUB_WORKSPACE}/openwrt_bin/build_info"
 
     - name: Upload builder container
       if: success()
