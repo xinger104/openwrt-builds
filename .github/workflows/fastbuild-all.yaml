@@ -10,7 +10,6 @@ env:
   BUILDER_BIN_DIR: /home/builder/openwrt_bin
   BUILDER_PROFILE_DIR: /home/builder/user/current
   BUILDER_TMP_DIR: /tmp/builder
-  OPENWRT_SOURCE_DIR: /tmp/builder/openwrt
   CCACHE_DIR: ${{ github.workspace }}/ghcache
   CCACHE_MAXSIZE: 2G
 jobs:
@@ -69,7 +68,7 @@ jobs:
         #!/bin/bash
         set -e
         exec_envs=()
-        for env_name in BUILDER_TMP_DIR BUILDER_BIN_DIR BUILDER_PROFILE_DIR OPENWRT_DIR OPENWRT_SOURCE_DIR REPO_URL REPO_BRANCH; do
+        for env_name in BUILDER_TMP_DIR BUILDER_BIN_DIR BUILDER_PROFILE_DIR OPENWRT_DIR REPO_URL REPO_BRANCH; do
           exec_envs+=( -e "${env_name}=${!env_name}" )
         done
         exec docker exec -u 0 -i "${exec_envs[@]}" "$@"
@@ -85,15 +84,17 @@ jobs:
         BUILDER_TAG_INC="${BUILDER_TAG}-inc"
         BUILDER_IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${CONTAINER_ID}:${BUILDER_TAG}"
         BUILDER_IMAGE_INC="ghcr.io/${{ github.repository_owner }}/${CONTAINER_ID}:${BUILDER_TAG_INC}"
-        if [ "${OPT_REBUILD}" != "1" ] && ! docker buildx imagetools inspect "${BUILDER_IMAGE_INC}" &>/dev/null; then
-          if ! docker buildx imagetools inspect "${BUILDER_IMAGE_BASE}" &>/dev/null; then
-            OPT_REBUILD=1; echo "Will rebuild base builder"
-          else
-            docker buildx imagetools create -t "${BUILDER_IMAGE_INC}" "${BUILDER_IMAGE_BASE}"
-            echo "Created incremental builder from base"
-          fi
+        if [ "${OPT_REBUILD}" = "1" ]; then
+          echo "Rebuilding base builder '${BUILDER_IMAGE_BASE}'"
+        elif docker buildx imagetools inspect "${BUILDER_IMAGE_INC}" &>/dev/null; then
+          : # incremental image exists
+        elif docker buildx imagetools inspect "${BUILDER_IMAGE_BASE}" &>/dev/null; then
+          docker buildx imagetools create -t "${BUILDER_IMAGE_INC}" "${BUILDER_IMAGE_BASE}"
+          echo "Created incremental builder from base"
+        else
+          OPT_REBUILD=1
+          echo "Rebuilding base builder '${BUILDER_IMAGE_BASE}'"
         fi
-        [ "${OPT_REBUILD}" = "1" ] && echo "Re-creating base builder '${BUILDER_IMAGE_BASE}'"
         for var in OPT_REBUILD BUILDER_TAG_INC BUILDER_IMAGE_BASE BUILDER_IMAGE_INC; do echo "${var}=${!var}" >> "$GITHUB_ENV"; done
         pull_image() {
           local img="$1"
@@ -117,9 +118,7 @@ jobs:
         fi
         docker_exec "${CONTAINER_ID}" bash <<'DKSETUP'
         set -e
-        OPENWRT_DIR="/home/builder/openwrt"
-        [ -d "${OPENWRT_DIR}" ] && OPENWRT_DIR="${OPENWRT_SOURCE_DIR}"
-        [ ! -d "${OPENWRT_DIR}" ] || rm -rf "${OPENWRT_DIR}"
+        rm -rf "${OPENWRT_DIR}"
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install -y --no-upgrade build-essential clang curl flex bison g++ gawk gcc gettext git libncurses5-dev libssl-dev python3-distutils-extra rsync swig unzip zlib1g-dev file wget ccache golang
         DKSETUP
@@ -130,62 +129,31 @@ jobs:
         set -e
         link_bin() {
           mountpoint -q "${BUILDER_BIN_DIR}" || { echo "::error::not mounted" >&2; exit 1; }
-          [ -L "/home/builder/openwrt/bin" ] && [ "$(readlink "/home/builder/openwrt/bin")" = "${BUILDER_BIN_DIR}" ] && return
-          rm -rf /home/builder/openwrt/bin && ln -sf "${BUILDER_BIN_DIR}" /home/builder/openwrt/bin
+          [ -L "${OPENWRT_DIR}/bin" ] && [ "$(readlink "${OPENWRT_DIR}/bin")" = "${BUILDER_BIN_DIR}" ] && return
+          rm -rf "${OPENWRT_DIR}/bin" && ln -sf "${BUILDER_BIN_DIR}" "${OPENWRT_DIR}/bin"
         }
-        [ -n "${OPENWRT_DIR}" ] && [ -n "${OPENWRT_SOURCE_DIR}" ] || { echo "::error::Missing OPENWRT_* dir vars" >&2; exit 1; }
+        [ -n "${OPENWRT_DIR}" ] || { echo "::error::Missing OPENWRT_DIR" >&2; exit 1; }
         [ -n "${REPO_URL}" ] && [ -n "${REPO_BRANCH}" ] || { echo "::error::'REPO_URL' or 'REPO_BRANCH' is empty" >&2; exit 1; }
-        if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ] && [ -d "/home/builder/openwrt/.git" ]; then
-          git clone "/home/builder/openwrt" "${OPENWRT_DIR}"
-          git -C "${OPENWRT_DIR}" remote set-url origin "${REPO_URL}"
-          git -C "${OPENWRT_DIR}" fetch
-          git -C "${OPENWRT_DIR}" checkout "${REPO_BRANCH}"
-          git -C "${OPENWRT_DIR}" pull --rebase
-        else
-          mkdir -p "${OPENWRT_DIR}"; cd "${OPENWRT_DIR}"
-          git init
-          git remote add origin "${REPO_URL}" 2>/dev/null || git remote set-url origin "${REPO_URL}"
-          git fetch
-          git checkout "${REPO_BRANCH}"
-          git pull --rebase
-          mkdir -p files
-          git log origin/main.."${REPO_BRANCH}" --oneline > files/build_info 2>/dev/null || echo "(no commits ahead of main)" > files/build_info
-          cp files/build_info "${BUILDER_BIN_DIR}" 2>/dev/null || true
-        fi
+        mkdir -p "${OPENWRT_DIR}/files"; cd "${OPENWRT_DIR}"
+        git init
+        git remote add origin "${REPO_URL}" 2>/dev/null || git remote set-url origin "${REPO_URL}"
+        git fetch
+        git checkout "${REPO_BRANCH}"
+        git pull --rebase
+        git log origin/main.."${REPO_BRANCH}" --oneline > files/build_info 2>/dev/null || echo "(no commits ahead of main)" > files/build_info
+        cp files/build_info "${BUILDER_BIN_DIR}" 2>/dev/null || true
         link_bin
-        if [ -f "${BUILDER_PROFILE_DIR}/files/feeds.conf" ]; then
-          cp "${BUILDER_PROFILE_DIR}/files/feeds.conf" "${OPENWRT_DIR}/feeds.conf"
-        fi
-        if [ -f "${OPENWRT_DIR}/feeds.conf" ]; then
-          cp "${OPENWRT_DIR}/feeds.conf" "${BUILDER_TMP_DIR}/feeds.conf.bak"
-        fi
-        if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ]; then
-          if (set +e; cd "/home/builder/openwrt" && ./scripts/feeds list -fs > "${BUILDER_TMP_DIR}/feeds.conf.prev"); then
-            mv "${BUILDER_TMP_DIR}/feeds.conf.prev" "${OPENWRT_DIR}/feeds.conf"
-          else
-            echo "::warning::Could not read previous feeds list"
-            rm -f "${BUILDER_TMP_DIR}/feeds.conf.prev"
-          fi
-        fi
+        f="${BUILDER_PROFILE_DIR}/files/feeds.conf"
+        [ -f "$f" ] && cp "$f" "${OPENWRT_DIR}/feeds.conf"
+        cp "${OPENWRT_DIR}/feeds.conf" "${BUILDER_TMP_DIR}/feeds.conf.bak" 2>/dev/null || true
         (cd "${OPENWRT_DIR}"; rm -rf feeds/* 2>/dev/null; ./scripts/feeds update -a; ./scripts/feeds install -a)
-        if [ -f "${BUILDER_TMP_DIR}/feeds.conf.bak" ]; then
-          mv "${BUILDER_TMP_DIR}/feeds.conf.bak" "${OPENWRT_DIR}/feeds.conf"
-        fi
+        [ -f "${BUILDER_TMP_DIR}/feeds.conf.bak" ] && mv "${BUILDER_TMP_DIR}/feeds.conf.bak" "${OPENWRT_DIR}/feeds.conf"
         cp "${BUILDER_PROFILE_DIR}/config.diff" "${OPENWRT_DIR}/.config"
         echo 'CONFIG_CCACHE_DIR="/ghcache"' >> "${OPENWRT_DIR}/.config"
         cp "${BUILDER_PROFILE_DIR}/cvn.config" "${OPENWRT_DIR}/cvn.config"
-        if [ -n "$(ls -A "${BUILDER_PROFILE_DIR}/patches" 2>/dev/null)" ]; then
-          find "${BUILDER_PROFILE_DIR}/patches" -type f -name '*.patch' -print0 | sort -z | xargs -0 -n 1 sh -c "cat '$1' | patch -d '${OPENWRT_DIR}' -p0 --forward" sh
-        fi
+        find "${BUILDER_PROFILE_DIR}/patches" -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null | sort -z | xargs -0 -n 1 sh -c "patch -d '${OPENWRT_DIR}' -p0 --forward < '\$1'" sh
         [ ! -d "${BUILDER_PROFILE_DIR}/files" ] || cp -r "${BUILDER_PROFILE_DIR}/files/" "${OPENWRT_DIR}/"
         [ ! -f "${BUILDER_PROFILE_DIR}/custom.sh" ] || (cd "${OPENWRT_DIR}"; /bin/bash "${BUILDER_PROFILE_DIR}/custom.sh")
-        if [ "${OPENWRT_DIR}" = "${OPENWRT_SOURCE_DIR}" ]; then
-          rsync -am --size-only --no-t --delete \
-            --exclude={/bin,/dl,/tmp,/build_dir,/staging_dir,/toolchain,/logs,'*.o',key-build\*} \
-            "${OPENWRT_DIR}/" "/home/builder/openwrt/"
-          rm -rf "${OPENWRT_DIR}"
-          echo "OPENWRT_DIR=/home/builder/openwrt" >> $GITHUB_ENV
-        fi
         cd "${OPENWRT_DIR}"; make defconfig; cat cvn.config >> .config
         ln -sf /dlcache dl 2>/dev/null || true
         make download -j8
@@ -197,14 +165,12 @@ jobs:
       run: |
         cat > /tmp/compile_runner.sh << 'CRUN'
         set -e
-        compile() {
-          cd "${OPENWRT_DIR}"
-          local nthread=$(($(nproc) + 1))
-          export FORCE_UNSAFE_CONFIGURE=1
-          echo "${nthread} thread compile: (MODE=${MODE})"; make -j${nthread} V=${MODE}
-        }
         [ ! -f "${BUILDER_PROFILE_DIR}/pre_compile.sh" ] || /bin/bash "${BUILDER_PROFILE_DIR}/pre_compile.sh"
-        compile
+        cd "${OPENWRT_DIR}"
+        export FORCE_UNSAFE_CONFIGURE=1
+        nthread=$(($(nproc) + 1))
+        echo "${nthread} thread compile: (MODE=${MODE})"
+        make -j${nthread} V=${MODE}
         CRUN
         docker cp /tmp/compile_runner.sh "${CONTAINER_ID}:/tmp/compile_runner.sh"
         echo "started=1" >> $GITHUB_OUTPUT
@@ -222,9 +188,7 @@ jobs:
         sudo chown -R "$(id -u):$(id -g)" "${GITHUB_WORKSPACE}/openwrt_bin"
         mkdir -p "${GITHUB_WORKSPACE}/openwrt_firmware"
         cd "${GITHUB_WORKSPACE}/openwrt_bin/targets/"*/*/
-        for f in *; do
-          [ "$f" != "packages" ] && [ -f "$f" ] && mv "$f" "${GITHUB_WORKSPACE}/openwrt_firmware/"
-        done
+        find . -maxdepth 1 -type f ! -name packages -exec mv {} "${GITHUB_WORKSPACE}/openwrt_firmware/" +
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Create GitHub release
@@ -241,7 +205,6 @@ jobs:
       run: |
         docker_exec "${CONTAINER_ID}" bash <<'PC'
         set -e
-        if [ -d "${OPENWRT_SOURCE_DIR}" ]; then rm -rf "${OPENWRT_SOURCE_DIR}"; fi
         cd "${OPENWRT_DIR}"; make clean; rm -rf feeds/* tmp/*; find dl -type f -mtime +30 -delete
         PC
         docker commit -a "openwrt-fastbuild" -m "Building at $(date)" "${CONTAINER_ID}" "${BUILDER_IMAGE_INC}"
