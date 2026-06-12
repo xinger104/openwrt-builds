@@ -4,8 +4,8 @@ permissions: {contents: write, packages: write}
 env:
   GH_TOKEN: ${{ github.token }}
   CONTAINER_ID: ${{ github.event.repository.name }}
-  GH_PAGES: https://w1700k.github.io/${{ github.event.repository.name }}/
-  BASE_IMAGE: ghcr.io/w1700k/fastbuild_base:debian-arm
+  GH_PAGES: https://xinger104.github.io/${{ github.event.repository.name }}/
+  BASE_IMAGE: ghcr.io/xinger104/fastbuild_base:debian-arm
   OPENWRT_DIR: /home/builder/openwrt
   BUILDER_BIN_DIR: /home/builder/openwrt_bin
   BUILDER_PROFILE_DIR: /home/builder/user/current
