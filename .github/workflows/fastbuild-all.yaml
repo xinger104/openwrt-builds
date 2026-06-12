@@ -143,12 +143,9 @@ jobs:
         git log origin/main.."${REPO_BRANCH}" --oneline > files/build_info 2>/dev/null || echo "(no commits ahead of main)" > files/build_info
         cp files/build_info "${BUILDER_BIN_DIR}" 2>/dev/null || true
         link_bin
-        if [ -f "${BUILDER_PROFILE_DIR}/files/feeds.conf" ]; then
-          cp "${BUILDER_PROFILE_DIR}/files/feeds.conf" "${OPENWRT_DIR}/feeds.conf"
-        fi
-        if [ -f "${OPENWRT_DIR}/feeds.conf" ]; then
-          cp "${OPENWRT_DIR}/feeds.conf" "${BUILDER_TMP_DIR}/feeds.conf.bak"
-        fi
+        f="${BUILDER_PROFILE_DIR}/files/feeds.conf"
+        [ -f "$f" ] && cp "$f" "${OPENWRT_DIR}/feeds.conf"
+        cp "${OPENWRT_DIR}/feeds.conf" "${BUILDER_TMP_DIR}/feeds.conf.bak" 2>/dev/null || true
         (cd "${OPENWRT_DIR}"; rm -rf feeds/* 2>/dev/null; ./scripts/feeds update -a; ./scripts/feeds install -a)
         [ -f "${BUILDER_TMP_DIR}/feeds.conf.bak" ] && mv "${BUILDER_TMP_DIR}/feeds.conf.bak" "${OPENWRT_DIR}/feeds.conf"
         cp "${BUILDER_PROFILE_DIR}/config.diff" "${OPENWRT_DIR}/.config"
