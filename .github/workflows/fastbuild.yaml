@@ -1,10 +1,10 @@
-name: fastbuild ubi2-oc, ubi2, snapshot
+name: fastbuild snapshot
 on: workflow_dispatch
 permissions: {contents: write, packages: write, actions: write}
 env:
   GH_TOKEN: ${{ github.token }}
   CID: ${{ github.event.repository.name }}
-  GH_PAGES: https://w1700k.github.io/builds/
+  GH_PAGES: https://xinger104.github.io/builds/
   BLDROOT: ghcr.io/w1700k/fastbuild_base:debian-arm
   DK_OPENWRT: /home/builder/openwrt
   DK_BIN: /home/builder/openwrt_bin
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
-      matrix: {target: [ubi2-oc, ubi2, SNAPSHOT]}
+      matrix: {target: [SNAPSHOT]}
     defaults:
       run:
         shell: bash -eo pipefail {0}
